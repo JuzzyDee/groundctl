@@ -11,9 +11,11 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ImageContent
 
 from .rover_client import RoverClient
+from .navigation import WaypointNavigator
 
 server = Server("groundctl")
 rover = RoverClient()
+navigator = WaypointNavigator(rover)
 
 
 def _tool(name: str, description: str, properties: dict, required: list[str] | None = None) -> Tool:
@@ -70,6 +72,27 @@ async def list_tools() -> list[Tool]:
         _tool("get_checkpoints", "Get the list of checkpoints for the current mission.", {}, []),
         _tool("checkpoint_reached", "Report that the rover has reached a checkpoint.", {}, []),
         _tool("get_mission_history", "Get past mission records.", {}, []),
+        # Navigation
+        _tool(
+            "navigate_to",
+            "Navigate the rover to a GPS coordinate using proportional steering. The rover will continuously adjust heading and drive until it arrives within the threshold distance. This runs asynchronously — the rover drives itself while this tool is active.",
+            {
+                "latitude": {"type": "number", "description": "Target latitude"},
+                "longitude": {"type": "number", "description": "Target longitude"},
+                "speed": {"type": "number", "description": "Forward speed 0.0-1.0 (default 0.4)"},
+            },
+            ["latitude", "longitude"],
+        ),
+        _tool(
+            "distance_to",
+            "Calculate distance in meters from the rover's current position to a GPS coordinate.",
+            {
+                "latitude": {"type": "number", "description": "Target latitude"},
+                "longitude": {"type": "number", "description": "Target longitude"},
+            },
+            ["latitude", "longitude"],
+        ),
+        _tool("cancel_navigation", "Cancel any active navigation. The rover will stop.", {}, []),
         # Interventions
         _tool("start_intervention", "Start an intervention for the current ride.", {}, []),
         _tool("end_intervention", "End the current intervention.", {}, []),
@@ -156,6 +179,26 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         case "get_mission_history":
             result = await rover.get_mission_history()
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+        # Navigation
+        case "navigate_to":
+            speed = arguments.get("speed")
+            result = await navigator.navigate_to(
+                arguments["latitude"],
+                arguments["longitude"],
+                speed=speed,
+            )
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+        case "distance_to":
+            distance = await navigator.distance_to(
+                arguments["latitude"], arguments["longitude"]
+            )
+            return [TextContent(type="text", text=f"{distance:.1f} meters")]
+
+        case "cancel_navigation":
+            await navigator.stop()
+            return [TextContent(type="text", text="Navigation cancelled")]
 
         # Interventions
         case "start_intervention":

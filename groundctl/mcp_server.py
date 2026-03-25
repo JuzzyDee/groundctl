@@ -12,10 +12,13 @@ from mcp.types import Tool, TextContent, ImageContent
 
 from .rover_client import RoverClient
 from .navigation import WaypointNavigator
+from .listener import SpeechListener
 
 server = Server("groundctl")
 rover = RoverClient()
 navigator = WaypointNavigator(rover)
+listener = SpeechListener()
+listener.start()
 
 
 def _tool(name: str, description: str, properties: dict, required: list[str] | None = None) -> Tool:
@@ -97,6 +100,22 @@ async def list_tools() -> list[Tool]:
         _tool("start_intervention", "Start an intervention for the current ride.", {}, []),
         _tool("end_intervention", "End the current intervention.", {}, []),
         _tool("get_interventions", "Get intervention history.", {}, []),
+        # Hearing
+        _tool(
+            "listen",
+            "Listen for speech through the rover's microphone. Blocks until someone speaks (or timeout). Returns the transcribed text. Optionally responds with TTS before listening, for natural conversation flow.",
+            {
+                "say_first": {"type": "string", "description": "Optional: speak this text before listening (for conversational back-and-forth)"},
+                "timeout": {"type": "number", "description": "Max seconds to wait for speech (default 30)"},
+            },
+            [],
+        ),
+        _tool(
+            "get_speech_log",
+            "Get recent speech the rover has overheard via its always-on microphone. Returns transcriptions captured since the last check. Use this to see if anyone has spoken to the rover without explicitly calling listen.",
+            {},
+            [],
+        ),
     ]
 
 
@@ -140,6 +159,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
         case "get_status":
             data = await rover.get_data()
+            recent_speech = listener.get_recent_speech()
+            if recent_speech:
+                data["recent_speech"] = recent_speech
             return [TextContent(type="text", text=json.dumps(data, indent=2))]
 
         # Control
@@ -212,6 +234,23 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         case "get_interventions":
             result = await rover.get_interventions()
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+        # Hearing
+        case "listen":
+            say_first = arguments.get("say_first")
+            if say_first:
+                await rover.speak(say_first)
+            timeout = arguments.get("timeout", 30.0)
+            text = listener.listen_once(timeout=timeout)
+            if text:
+                return [TextContent(type="text", text=text)]
+            return [TextContent(type="text", text="(no speech detected)")]
+
+        case "get_speech_log":
+            entries = listener.get_recent_speech()
+            if entries:
+                return [TextContent(type="text", text=json.dumps(entries, indent=2))]
+            return [TextContent(type="text", text="No recent speech")]
 
         case _:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]

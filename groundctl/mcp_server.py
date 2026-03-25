@@ -12,11 +12,13 @@ from mcp.types import Tool, TextContent, ImageContent
 
 from .rover_client import RoverClient
 from .navigation import WaypointNavigator
+from .intent import IntentExecutor, IntentType
 from .listener import SpeechListener
 
 server = Server("groundctl")
 rover = RoverClient()
 navigator = WaypointNavigator(rover)
+executor = IntentExecutor(rover)
 listener = SpeechListener()
 listener.start()
 
@@ -100,6 +102,38 @@ async def list_tools() -> list[Tool]:
         _tool("start_intervention", "Start an intervention for the current ride.", {}, []),
         _tool("end_intervention", "End the current intervention.", {}, []),
         _tool("get_interventions", "Get intervention history.", {}, []),
+        # Intent-based movement
+        _tool(
+            "go_forward",
+            "Start moving forward at the given speed. The rover drives continuously until you say stop or change intent. No need to call repeatedly — set it once.",
+            {
+                "speed": {"type": "number", "description": "Forward speed 0.0-1.0 (default 0.4)"},
+            },
+            [],
+        ),
+        _tool(
+            "follow_bearing",
+            "Drive continuously toward a compass bearing. The rover auto-corrects heading at 10Hz. Set once, it keeps going.",
+            {
+                "bearing": {"type": "number", "description": "Target compass bearing in degrees (0=north, 90=east, 180=south, 270=west)"},
+                "speed": {"type": "number", "description": "Forward speed 0.0-1.0 (default 0.4)"},
+            },
+            ["bearing"],
+        ),
+        _tool(
+            "turn_to",
+            "Turn in place to face a compass bearing. Completes when facing within 5 degrees of target.",
+            {
+                "bearing": {"type": "number", "description": "Target compass bearing in degrees"},
+            },
+            ["bearing"],
+        ),
+        _tool(
+            "set_intent",
+            "Get the current movement intent and its status. If a navigate_to or turn_to completed, returns the result.",
+            {},
+            [],
+        ),
         # Hearing
         _tool(
             "listen",
@@ -170,6 +204,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             return [TextContent(type="text", text=result.get("message", "OK"))]
 
         case "stop":
+            await executor.set_idle()
             result = await rover.stop()
             return [TextContent(type="text", text="Stopped")]
 
@@ -235,6 +270,36 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             result = await rover.get_interventions()
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
+        # Intent-based movement
+        case "go_forward":
+            speed = arguments.get("speed", 0.4)
+            result = await executor.set_intent(IntentType.GO_FORWARD, speed=speed)
+            return [TextContent(type="text", text=json.dumps(result))]
+
+        case "follow_bearing":
+            speed = arguments.get("speed", 0.4)
+            result = await executor.set_intent(
+                IntentType.FOLLOW_BEARING,
+                bearing=arguments["bearing"],
+                speed=speed,
+            )
+            return [TextContent(type="text", text=json.dumps(result))]
+
+        case "turn_to":
+            result = await executor.set_intent(IntentType.TURN_TO, bearing=arguments["bearing"])
+            return [TextContent(type="text", text=json.dumps(result))]
+
+        case "set_intent":
+            intent = executor.current_intent
+            response = {
+                "intent": intent.type.value,
+                "speed": intent.speed,
+                "active": executor.is_active,
+            }
+            if executor.last_result:
+                response["last_result"] = executor.last_result
+            return [TextContent(type="text", text=json.dumps(response, indent=2))]
+
         # Hearing
         case "listen":
             say_first = arguments.get("say_first")
@@ -257,6 +322,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
 
 async def main():
+    executor.start()
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 

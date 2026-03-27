@@ -1,17 +1,21 @@
 """Perception module — the rover's eyes.
 
-Takes raw camera frames, runs YOLO detection, and produces structured
-scene understanding that feeds into:
+Takes raw camera frames, runs YOLO detection and depth estimation,
+producing structured scene understanding that feeds into:
 - Claude (via MCP status) — "what am I looking at?"
 - Intent executor — follow_object tracking, approach targeting
-- Safety layer — emergency stop on close obstacles
+- Safety layer — emergency stop on close obstacles (depth-based)
+
+Two perception layers:
+- YOLO11n at 20fps: object tracking for follow/approach intents
+- DepthAnything at 2-3fps: proximity safety, catches EVERYTHING
+  regardless of object class (barriers, walls, kangaroos, bins)
 
 This is the sensory cortex. Camera in, understanding out.
-Phase 1: YOLO pretrained (person, dog, car, bicycle, etc.)
-Phase 2: Fine-tuned on Yeppoon environment if needed.
 """
 
 from dataclasses import dataclass, field
+import numpy as np
 from ultralytics import YOLO
 
 
@@ -333,3 +337,162 @@ class Perceiver:
             )
 
         return frame
+
+
+@dataclass
+class DepthResult:
+    """Result of a depth-based proximity check."""
+
+    emergency_stop: bool
+    obstacle_detected: bool
+    discontinuity_strength: float  # 0.0 = smooth ground, 1.0 = wall in face
+    centre_close_ratio: float  # what % of centre is "close"
+    depth_map: np.ndarray | None = field(default=None, repr=False)
+
+    def to_summary(self) -> str:
+        if self.emergency_stop:
+            return f"⚠ DEPTH STOP — obstacle detected (discontinuity: {self.discontinuity_strength:.2f}, close: {self.centre_close_ratio:.0%})"
+        elif self.obstacle_detected:
+            return f"Caution — object ahead (discontinuity: {self.discontinuity_strength:.2f})"
+        return "Clear"
+
+
+class DepthSafety:
+    """Depth-based proximity detection — catches what YOLO misses.
+
+    Uses DepthAnything to estimate relative depth from a single camera frame.
+    Detects obstacles by finding gradient discontinuities — the ground creates
+    a smooth near-to-far gradient from bottom to top. An obstacle breaks that
+    gradient with a sharp edge.
+
+    This catches barriers, walls, kerbs, unknown objects — anything that's
+    close, regardless of whether YOLO knows what it is.
+    """
+
+    def __init__(self, model_name: str = "depth-anything/Depth-Anything-V2-Small-hf",
+                 input_size: int = 518):
+        from transformers import pipeline as hf_pipeline
+        self._pipe = hf_pipeline("depth-estimation", model=model_name)
+        self._input_size = input_size
+
+    def check(self, frame, return_depth_map: bool = False) -> DepthResult:
+        """Run depth estimation and check for obstacles.
+
+        Args:
+            frame: numpy array (BGR from OpenCV) or PIL Image
+            return_depth_map: if True, include the raw depth map in result
+
+        Returns:
+            DepthResult with emergency_stop flag and diagnostics
+        """
+        from PIL import Image
+        import cv2
+
+        # Convert to PIL Image from whatever input we got
+        if isinstance(frame, str):
+            pil_image = Image.open(frame)
+        elif isinstance(frame, np.ndarray):
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(frame_rgb)
+        else:
+            pil_image = frame
+
+        # Resize for speed — safety doesn't need full resolution
+        w, h = pil_image.size
+        scale = self._input_size / max(w, h)
+        if scale < 1.0:
+            new_w, new_h = int(w * scale), int(h * scale)
+            pil_image = pil_image.resize((new_w, new_h))
+
+        result = self._pipe(pil_image)
+        depth_map = np.array(result["depth"])
+
+        # Analyse the centre third for obstacles
+        dh, dw = depth_map.shape
+        centre_left = dw // 3
+        centre_right = 2 * dw // 3
+        centre_strip = depth_map[:, centre_left:centre_right]
+
+        # Gradient discontinuity detection:
+        # Ground = smooth gradient (depth decreasing from bottom to top)
+        # Obstacle = sharp jump where depth suddenly increases going up
+        #
+        # Sample rows in the centre strip, moving from bottom to top
+        n_samples = 20
+        row_indices = np.linspace(dh - 1, dh // 4, n_samples, dtype=int)
+        row_means = [centre_strip[row, :].mean() for row in row_indices]
+
+        # Find the maximum upward jump (depth increasing while moving up)
+        # Normalise to 0-255 range
+        max_jump = 0.0
+        for i in range(1, len(row_means)):
+            jump = row_means[i] - row_means[i - 1]  # positive = depth increased going up
+            if jump > max_jump:
+                max_jump = jump
+
+        # Normalise discontinuity to 0-1
+        depth_range = depth_map.max() - depth_map.min()
+        if depth_range > 0:
+            discontinuity = max_jump / depth_range
+        else:
+            discontinuity = 0.0
+
+        # Close ratio — what percentage of centre is in the "close" band
+        close_threshold = depth_map.max() * 0.7
+        close_pixels = (centre_strip > close_threshold).sum()
+        close_ratio = close_pixels / centre_strip.size
+
+        # Decision thresholds
+        # Two paths to emergency stop:
+        # 1. Gradient break + close = approaching an obstacle
+        # 2. Very high close ratio alone = already pressed against something
+        obstacle_detected = discontinuity > 0.15 or close_ratio > 0.3
+        emergency_stop = (discontinuity > 0.25 and close_ratio > 0.3) or close_ratio > 0.5
+
+        return DepthResult(
+            emergency_stop=emergency_stop,
+            obstacle_detected=obstacle_detected,
+            discontinuity_strength=discontinuity,
+            centre_close_ratio=close_ratio,
+            depth_map=depth_map if return_depth_map else None,
+        )
+
+    def render_depth_overlay(self, frame, depth_result: DepthResult):
+        """Render depth map as a semi-transparent overlay — for Claude Cam demo.
+
+        Args:
+            frame: numpy array (BGR)
+            depth_result: DepthResult with depth_map populated
+
+        Returns:
+            frame with depth overlay
+        """
+        import cv2
+
+        if depth_result.depth_map is None:
+            return frame
+
+        depth_map = depth_result.depth_map
+        h, w = frame.shape[:2]
+
+        # Normalise and colourise
+        depth_norm = ((depth_map - depth_map.min()) / (depth_map.max() - depth_map.min()) * 255).astype(np.uint8)
+        depth_colour = cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
+        depth_resized = cv2.resize(depth_colour, (w, h))
+
+        # Blend with original
+        blended = cv2.addWeighted(frame, 0.6, depth_resized, 0.4, 0)
+
+        # Warning text
+        if depth_result.emergency_stop:
+            cv2.putText(
+                blended,
+                "!! DEPTH STOP !!",
+                (w // 2 - 150, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 0, 255),
+                3,
+            )
+
+        return blended

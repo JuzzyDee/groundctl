@@ -14,12 +14,14 @@ from .rover_client import RoverClient
 from .navigation import WaypointNavigator
 from .intent import IntentExecutor, IntentType
 from .listener import SpeechListener
+from .places import PlaceStore
 
 server = Server("groundctl")
 rover = RoverClient()
 navigator = WaypointNavigator(rover)
 executor = IntentExecutor(rover)
 listener = SpeechListener()
+places = PlaceStore()
 listener.start()
 
 
@@ -133,6 +135,39 @@ async def list_tools() -> list[Tool]:
             "Get the current movement intent and its status. If a navigate_to or turn_to completed, returns the result.",
             {},
             [],
+        ),
+        # Spatial memory
+        _tool(
+            "mark_place",
+            "Mark the rover's current GPS position as a named place. Use this to remember locations you want to return to later.",
+            {
+                "name": {"type": "string", "description": "A human-friendly name for this place (e.g. 'start', 'duckpond', 'mango tree')"},
+                "radius": {"type": "number", "description": "How big this place is in metres (default 5). A bench is 2m, a park is 50m."},
+            },
+            ["name"],
+        ),
+        _tool(
+            "go_to_place",
+            "Navigate to a previously marked named place. The rover will drive to the location autonomously.",
+            {
+                "name": {"type": "string", "description": "Name of the place to navigate to"},
+                "speed": {"type": "number", "description": "Forward speed 0.0-1.0 (default 0.4)"},
+            },
+            ["name"],
+        ),
+        _tool(
+            "where_am_i",
+            "Check if the rover is at a known named place, and list all known places.",
+            {},
+            [],
+        ),
+        _tool(
+            "forget_place",
+            "Remove a named place from spatial memory.",
+            {
+                "name": {"type": "string", "description": "Name of the place to forget"},
+            },
+            ["name"],
         ),
         # Hearing
         _tool(
@@ -299,6 +334,43 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             if executor.last_result:
                 response["last_result"] = executor.last_result
             return [TextContent(type="text", text=json.dumps(response, indent=2))]
+
+        # Spatial memory
+        case "mark_place":
+            data = await rover.get_data()
+            lat = float(data.get("latitude", 0))
+            lon = float(data.get("longitude", 0))
+            radius = arguments.get("radius", 5.0)
+            place = places.mark(arguments["name"], lat, lon, radius)
+            return [TextContent(type="text", text=f"Marked '{place.name}' at ({place.lat:.6f}, {place.lon:.6f}), {place.radius:.0f}m radius")]
+
+        case "go_to_place":
+            place = places.get(arguments["name"])
+            if not place:
+                known = [p.name for p in places.list_all()]
+                return [TextContent(type="text", text=f"Unknown place: '{arguments['name']}'. Known places: {known}")]
+            speed = arguments.get("speed", 0.4)
+            places.visit(arguments["name"])
+            result = await navigator.navigate_to(place.lat, place.lon, speed=speed)
+            return [TextContent(type="text", text=json.dumps({"place": place.name, **result}, indent=2))]
+
+        case "where_am_i":
+            data = await rover.get_data()
+            lat = float(data.get("latitude", 0))
+            lon = float(data.get("longitude", 0))
+            current = places.find_current(lat, lon)
+            response = f"Position: ({lat:.6f}, {lon:.6f})\n"
+            if current:
+                response += f"You are at: {current.name}\n"
+            else:
+                response += "Not at any named place.\n"
+            response += "\n" + places.to_summary()
+            return [TextContent(type="text", text=response)]
+
+        case "forget_place":
+            if places.remove(arguments["name"]):
+                return [TextContent(type="text", text=f"Forgot '{arguments['name']}'")]
+            return [TextContent(type="text", text=f"No place named '{arguments['name']}'")]
 
         # Hearing
         case "listen":
